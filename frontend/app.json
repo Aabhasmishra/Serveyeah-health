@@ -1,0 +1,52 @@
+{
+  "expo": {
+    "name": "ServeYeah Health",
+    "slug": "serveyeah-health",
+    "version": "1.0.0",
+    "orientation": "portrait",
+    "icon": "./assets/Logo3.png",
+    "userInterfaceStyle": "light",
+    "ios": {
+      "supportsTablet": true,
+      "infoPlist": {
+        "NSCameraUsageDescription": "ServeYeah Health needs access to your camera to take student photographs for the health screening form.",
+        "NSPhotoLibraryUsageDescription": "ServeYeah Health needs access to your photo library to select student photographs for the health screening form."
+      }
+    },
+    "android": {
+      "package": "com.serveyeah.health",
+      "versionCode": 1,
+      "adaptiveIcon": {
+        "backgroundColor": "#FFFFFF",
+        "foregroundImage": "./assets/Logo3.png",
+        "monochromeImage": "./assets/Logo3.png"
+      },
+      "predictiveBackGestureEnabled": false,
+      "permissions": [
+        "android.permission.CAMERA",
+        "android.permission.READ_EXTERNAL_STORAGE",
+        "android.permission.WRITE_EXTERNAL_STORAGE",
+        "android.permission.RECORD_AUDIO"
+      ]
+    },
+    "plugins": [
+      [
+        "expo-image-picker",
+        {
+          "photosPermission": "The app accesses your photos to let you choose a student photo.",
+          "cameraPermission": "The app accesses your camera to let you take a student photo."
+        }
+      ],
+      "expo-sharing"
+    ],
+    "web": {
+      "favicon": "./assets/favicon.png"
+    },
+    "extra": {
+      "eas": {
+        "projectId": "1f022648-3c75-4d38-86c9-d4b73fb9e7eb"
+      }
+    },
+    "owner": "aabhasmishra"
+  }
+}

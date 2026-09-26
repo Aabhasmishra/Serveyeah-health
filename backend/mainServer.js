@@ -44,7 +44,7 @@ const HTTPS_PORT = 5001;                // HTTPS (new)
 
 // SSL certificate paths (do not modify or generate)
 const SSL_KEY_PATH = '/etc/ssl/fintr/fintr.in.key';
-const SSL_CERT_PATH = '/etc/ssl/fintr/fintr_in.crt';
+const SSL_CERT_PATH = '/etc/ssl/fintr/fintr_in_fullchain.crt';
 
 // Track servers for graceful shutdown
 let httpServer = null;

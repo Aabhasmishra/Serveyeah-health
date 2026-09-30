@@ -146,10 +146,18 @@ async function runMigration() {
     // ============================================
     // 4. shree_raj_health_screenings table
     // ============================================
+    // The screening stores the person's identity directly (person_id / person_name)
+    // and has no foreign key dependency on shree_raj_health_users.
+    // user_id is retained as a nullable legacy column during migration only.
     await client.query(`
       CREATE TABLE IF NOT EXISTS shree_raj_health_screenings (
         id VARCHAR(10) PRIMARY KEY,
-        user_id VARCHAR(10) NOT NULL REFERENCES shree_raj_health_users(id),
+        person_id VARCHAR(10),
+        person_name VARCHAR(255) NOT NULL,
+        age_years INTEGER,
+        mobile_number VARCHAR(20),
+        is_student BOOLEAN DEFAULT false,
+        user_id VARCHAR(10),
         camp_id VARCHAR(10) REFERENCES camps(id),
         worker_id VARCHAR(10) REFERENCES workers(id),
         village VARCHAR(255),
@@ -162,9 +170,10 @@ async function runMigration() {
         blood_pressure VARCHAR(50),
         blood_sugar VARCHAR(50),
         heart_rate INTEGER,
-        ecg VARCHAR(255),
-        echo_heart VARCHAR(255),
+        ecg TEXT,
+        echo_heart TEXT,
         advice TEXT,
+        recommended_investigations TEXT,
         photo_url VARCHAR(500),
         screening_date DATE NOT NULL DEFAULT CURRENT_DATE,
         notes TEXT,
@@ -177,7 +186,10 @@ async function runMigration() {
 
     // Indexes for screenings
     await client.query(`
-      CREATE INDEX IF NOT EXISTS idx_screenings_user_id ON shree_raj_health_screenings(user_id)
+      CREATE INDEX IF NOT EXISTS idx_screenings_person_id ON shree_raj_health_screenings(person_id)
+    `);
+    await client.query(`
+      CREATE INDEX IF NOT EXISTS idx_screenings_mobile_number ON shree_raj_health_screenings(mobile_number)
     `);
     await client.query(`
       CREATE INDEX IF NOT EXISTS idx_screenings_camp_id ON shree_raj_health_screenings(camp_id)
@@ -300,6 +312,56 @@ async function runMigration() {
         EXECUTE FUNCTION generate_screening_id()
     `);
     console.log('✅ Created screening ID generation trigger (S0001, S0002, ...)');
+
+    // Keep the sequence aligned with the data so IDs stay sequential.
+    // A sequence is monotonic and DELETE does not rewind it, so deleting rows
+    // (e.g. verification fixtures) leaves the counter permanently ahead of
+    // MAX(id) and IDs appear to skip. Re-aligning here makes setup idempotent and
+    // guarantees the next generated ID is exactly (highest existing + 1).
+    // The lock conflicts with INSERT so MAX(id) cannot change mid-operation.
+    // For an empty table this sets the counter to 0 with is_called = false, so
+    // the first generated ID is still S0001.
+    await client.query(`
+      LOCK TABLE shree_raj_health_screenings IN SHARE ROW EXCLUSIVE MODE
+    `);
+    await client.query(`
+      SELECT setval(
+        'screenings_id_seq',
+        (SELECT COALESCE(MAX(NULLIF(regexp_replace(id, '\\D', '', 'g'), '')::int), 0)
+           FROM shree_raj_health_screenings),
+        (SELECT COALESCE(MAX(NULLIF(regexp_replace(id, '\\D', '', 'g'), '')::int), 0)
+           FROM shree_raj_health_screenings) > 0
+      )
+    `);
+    console.log('✅ Aligned screenings_id_seq with existing data (next ID continues sequentially)');
+
+    // Person sequence and trigger (P0001, P0002, ...)
+    // person_id identifies the person, not the screening, so the same person_id
+    // may legitimately appear across many screening records.
+    await client.query(`
+      CREATE SEQUENCE IF NOT EXISTS persons_id_seq START 1
+    `);
+    await client.query(`
+      CREATE OR REPLACE FUNCTION generate_person_id()
+      RETURNS TRIGGER AS $$
+      BEGIN
+        IF NEW.person_id IS NULL OR NEW.person_id = '' THEN
+          NEW.person_id := 'P' || LPAD(nextval('persons_id_seq')::TEXT, 4, '0');
+        END IF;
+        RETURN NEW;
+      END;
+      $$ LANGUAGE plpgsql
+    `);
+    await client.query(`
+      DROP TRIGGER IF EXISTS trigger_generate_person_id ON shree_raj_health_screenings
+    `);
+    await client.query(`
+      CREATE TRIGGER trigger_generate_person_id
+        BEFORE INSERT ON shree_raj_health_screenings
+        FOR EACH ROW
+        EXECUTE FUNCTION generate_person_id()
+    `);
+    console.log('✅ Created person ID generation trigger (P0001, P0002, ...)');
 
     // ============================================
     // Updated_at trigger function

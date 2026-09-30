@@ -14,9 +14,44 @@ function sanitizeScreening(screening) {
   return screening;
 }
 
-async function verifyUserExists(userId) {
-  const result = await query('SELECT id FROM shree_raj_health_users WHERE id = $1', [userId]);
-  return result.rows.length > 0;
+function normalizeAge(age) {
+  if (age === undefined || age === null || age === '') return null;
+  const parsed = parseInt(age, 10);
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : null;
+}
+
+// Recommended investigations are stored as a single comma-separated string of
+// catalogue IDs, e.g. "4,19,22,46,48". Normalise to a de-duplicated, ascending,
+// numeric-ID list so the stored value is canonical and safe to compare.
+// Accepts a string or an array of IDs/numeric strings.
+//
+// The catalogue is a fixed list of 52 investigations, mirrored by
+// frontend/src/constants/recommendedInvestigations.ts. IDs outside that range are
+// dropped so the field can never accumulate junk or future-unknown values.
+const MIN_INVESTIGATION_ID = 1;
+const MAX_INVESTIGATION_ID = 52;
+
+function normalizeRecommendedInvestigations(value) {
+  if (value === undefined || value === null || value === '') return null;
+
+  const parts = Array.isArray(value) ? value : String(value).split(',');
+
+  const ids = new Set();
+  for (const part of parts) {
+    const trimmed = String(part).trim();
+    if (!trimmed || !/^\d+$/.test(trimmed)) continue;
+    const parsed = parseInt(trimmed, 10);
+    if (
+      Number.isFinite(parsed) &&
+      parsed >= MIN_INVESTIGATION_ID &&
+      parsed <= MAX_INVESTIGATION_ID
+    ) {
+      ids.add(parsed);
+    }
+  }
+
+  if (ids.size === 0) return null;
+  return [...ids].sort((a, b) => a - b).join(',');
 }
 
 async function verifyCampExists(campId) {
@@ -31,6 +66,11 @@ async function verifyWorkerExists(workerId) {
 
 export async function createScreening(data) {
   const {
+    person_id,
+    person_name,
+    age_years,
+    mobile_number,
+    is_student,
     user_id,
     camp_id,
     worker_id,
@@ -47,19 +87,16 @@ export async function createScreening(data) {
     ecg,
     echo_heart,
     advice,
+    recommended_investigations,
     photo_url,
     screening_date,
     notes,
   } = data;
 
-  // Validate required fields
-  if (!user_id) {
-    throw new Error('user_id is required');
-  }
-
-  // Verify user exists
-  if (!(await verifyUserExists(user_id))) {
-    throw new Error('User not found');
+  // The person's name is stored directly on the screening record.
+  // person_id is optional; when omitted the DB trigger generates a new P-prefixed id.
+  if (!person_name || !String(person_name).trim()) {
+    throw new Error('person_name is required');
   }
 
   // Verify camp exists if provided
@@ -80,13 +117,20 @@ export async function createScreening(data) {
 
   const result = await query(
     `INSERT INTO shree_raj_health_screenings (
+      person_id, person_name, age_years, mobile_number, is_student,
       user_id, camp_id, worker_id, village, class_room, roll_no, care_of,
       height, weight, bmi, blood_pressure, blood_sugar, heart_rate,
-      ecg, echo_heart, advice, photo_url, screening_date, notes
-    ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19)
+      ecg, echo_heart, advice, recommended_investigations, photo_url, screening_date, notes
+    ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25)
     RETURNING *`,
     [
-      user_id,
+      person_id || null,
+      String(person_name).trim(),
+      normalizeAge(age_years),
+      mobile_number || null,
+      is_student === undefined ? false : !!is_student,
+      // Legacy field: retained for migration purposes only, no longer required.
+      user_id || null,
       camp_id || null,
       worker_id || null,
       village || null,
@@ -102,36 +146,149 @@ export async function createScreening(data) {
       ecg || null,
       echo_heart || null,
       advice || null,
+      normalizeRecommendedInvestigations(recommended_investigations),
       photo_url || null,
       screening_date || null,
       notes || null,
     ]
   );
 
-  return sanitizeScreening(result.rows[0]);
+  return sanitizeScreening(formatScreeningResponse(result.rows[0]));
+}
+
+// Mobile numbers are stored and searched as a bare 10-digit numeric value with no
+// country code or separators (e.g. "9876543210").
+//
+// The only requirement is exactly 10 digits, numeric characters only. There is
+// deliberately no leading-digit rule, so "1234567890" and "0123456789" are
+// valid. Nothing is stripped to make an invalid value valid: an input containing
+// spaces, hyphens or letters between digits is rejected rather than cleaned up,
+// and a country code is never added.
+const MOBILE_PATTERN = /^\d{10}$/;
+
+function normalizeMobileNumber(value) {
+  if (value === undefined || value === null) return null;
+  const trimmed = String(value).trim();
+  return MOBILE_PATTERN.test(trimmed) ? trimmed : null;
+}
+
+/**
+ * Look up an existing person by mobile number for the Old Entry flow.
+ *
+ * This is read-only: it never creates a person and never modifies a screening.
+ * A person's identity is their person_id; the profile fields are read from that
+ * person's most recent screening, because there is no separate persons table.
+ *
+ * If several distinct person_ids share the mobile number, none is silently
+ * chosen: matchCount > 1 and `person` is null, and `matches` carries enough
+ * detail for the caller to ask the worker which person they meant.
+ */
+export async function findPersonByMobile(mobileNumber) {
+  const normalized = normalizeMobileNumber(mobileNumber);
+  if (!normalized) {
+    const error = new Error('Please enter a valid 10-digit mobile number.');
+    error.statusCode = 400;
+    error.code = 'INVALID_MOBILE';
+    throw error;
+  }
+
+  const personIds = (
+    await query(
+      `SELECT DISTINCT person_id
+       FROM shree_raj_health_screenings
+       WHERE mobile_number = $1 AND person_id IS NOT NULL
+       ORDER BY person_id`,
+      [normalized]
+    )
+  ).rows.map((row) => row.person_id);
+
+  if (personIds.length === 0) {
+    return {
+      mobile_number: normalized,
+      match_count: 0,
+      person: null,
+      screenings: [],
+      matches: [],
+    };
+  }
+
+  // Profile fields come from each person's most recent screening.
+  const summaries = await query(
+    `SELECT DISTINCT ON (person_id)
+       person_id, person_name, mobile_number, age_years, is_student, screening_date
+     FROM shree_raj_health_screenings
+     WHERE person_id = ANY($1)
+     ORDER BY person_id, screening_date DESC, created_at DESC`,
+    [personIds]
+  );
+
+  // Reuse the existing read path so screening rows are shaped identically
+  // everywhere instead of duplicating the response mapping.
+  const screeningsByPerson = new Map();
+  for (const personId of personIds) {
+    screeningsByPerson.set(
+      personId,
+      await getScreeningsByPersonId(personId, { limit: 100, offset: 0 })
+    );
+  }
+
+  const matches = summaries.rows.map((row) => ({
+    person_id: row.person_id,
+    name: row.person_name,
+    mobile_number: row.mobile_number,
+    age_years: row.age_years,
+    is_student: row.is_student,
+    last_screening_date: row.screening_date,
+    screening_count: (screeningsByPerson.get(row.person_id) || []).length,
+  }));
+
+  if (matches.length > 1) {
+    // Ambiguous: hand back every candidate rather than picking one.
+    return {
+      mobile_number: normalized,
+      match_count: matches.length,
+      person: null,
+      screenings: [],
+      matches,
+    };
+  }
+
+  const person = matches[0];
+  return {
+    mobile_number: normalized,
+    match_count: 1,
+    person: {
+      id: person.person_id,
+      name: person.name,
+      mobile_number: person.mobile_number,
+      age_years: person.age_years,
+      is_student: person.is_student,
+    },
+    screenings: screeningsByPerson.get(person.person_id) || [],
+    matches,
+  };
 }
 
 export async function getScreeningById(id) {
   const result = await query(`
     SELECT s.*,
-      u.id as user_id, u.full_name as user_full_name, u.phone as user_phone,
-      c.id as camp_id, c.camp_name, c.camp_date,
-      w.id as worker_id, w.full_name as worker_full_name
+      c.id as joined_camp_id, c.camp_name, c.camp_date,
+      w.id as joined_worker_id, w.full_name as worker_full_name
     FROM shree_raj_health_screenings s
-    LEFT JOIN shree_raj_health_users u ON s.user_id = u.id
     LEFT JOIN camps c ON s.camp_id = c.id
     LEFT JOIN workers w ON s.worker_id = w.id
     WHERE s.id = $1
   `, [id]);
-  
+
   if (result.rows.length === 0) return null;
-  
+
   const row = result.rows[0];
   return formatScreeningResponse(row);
 }
 
 export async function getAllScreenings(options = {}) {
   const {
+    person_id,
     user_id,
     camp_id,
     worker_id,
@@ -144,25 +301,29 @@ export async function getAllScreenings(options = {}) {
 
   let sql = `
     SELECT s.*,
-      u.id as user_id, u.full_name as user_full_name, u.phone as user_phone,
-      c.id as camp_id, c.camp_name, c.camp_date,
-      w.id as worker_id, w.full_name as worker_full_name
+      c.id as joined_camp_id, c.camp_name, c.camp_date,
+      w.id as joined_worker_id, w.full_name as worker_full_name
     FROM shree_raj_health_screenings s
-    LEFT JOIN shree_raj_health_users u ON s.user_id = u.id
     LEFT JOIN camps c ON s.camp_id = c.id
     LEFT JOIN workers w ON s.worker_id = w.id
   `;
-  
+
   const params = [];
   const conditions = [];
   let paramIndex = 1;
+
+  if (person_id) {
+    conditions.push(`s.person_id = $${paramIndex}`);
+    params.push(person_id);
+    paramIndex++;
+  }
 
   if (user_id) {
     conditions.push(`s.user_id = $${paramIndex}`);
     params.push(user_id);
     paramIndex++;
   }
-  
+
   if (camp_id) {
     conditions.push(`s.camp_id = $${paramIndex}`);
     params.push(camp_id);
@@ -205,6 +366,10 @@ export async function getAllScreenings(options = {}) {
   return result.rows.map(formatScreeningResponse);
 }
 
+export async function getScreeningsByPersonId(personId, options = {}) {
+  return getAllScreenings({ ...options, person_id: personId });
+}
+
 export async function getScreeningsByUserId(userId, options = {}) {
   return getAllScreenings({ ...options, user_id: userId });
 }
@@ -219,9 +384,10 @@ export async function getScreeningsByWorkerId(workerId, options = {}) {
 
 export async function updateScreening(id, data) {
   const allowedFields = [
+    'person_id', 'person_name', 'age_years', 'mobile_number', 'is_student',
     'camp_id', 'worker_id', 'village', 'class_room', 'roll_no', 'care_of',
     'height', 'weight', 'bmi', 'blood_pressure', 'blood_sugar', 'heart_rate',
-    'ecg', 'echo_heart', 'advice', 'photo_url', 'screening_date', 'notes', 'is_active'
+    'ecg', 'echo_heart', 'advice', 'recommended_investigations', 'photo_url', 'screening_date', 'notes', 'is_active'
   ];
 
   const updates = [];
@@ -236,7 +402,13 @@ export async function updateScreening(id, data) {
   for (const [key, value] of Object.entries(data)) {
     if (allowedFields.includes(key) && value !== undefined) {
       updates.push(`${key} = $${paramIndex}`);
-      values.push(value);
+      values.push(
+        key === 'age_years'
+          ? normalizeAge(value)
+          : key === 'recommended_investigations'
+            ? normalizeRecommendedInvestigations(value)
+            : value
+      );
       paramIndex++;
     }
   }
@@ -277,7 +449,7 @@ export async function updateScreening(id, data) {
   const result = await query(sql, values);
 
   if (result.rows.length === 0) return null;
-  return sanitizeScreening(result.rows[0]);
+  return sanitizeScreening(formatScreeningResponse(result.rows[0]));
 }
 
 export async function deactivateScreening(id) {
@@ -286,27 +458,35 @@ export async function deactivateScreening(id) {
     [id]
   );
   if (result.rows.length === 0) return null;
-  return sanitizeScreening(result.rows[0]);
+  return sanitizeScreening(formatScreeningResponse(result.rows[0]));
 }
 
 function formatScreeningResponse(row) {
   return {
     id: row.id,
+    person_id: row.person_id,
+    person_name: row.person_name,
+    age_years: row.age_years,
+    mobile_number: row.mobile_number,
+    is_student: row.is_student,
+    // Legacy field kept for migration purposes; no longer used to resolve identity.
     user_id: row.user_id,
     camp_id: row.camp_id,
     worker_id: row.worker_id,
-    user: row.user_id ? {
-      id: row.user_id,
-      full_name: row.user_full_name,
-      phone: row.user_phone,
-    } : null,
+    person: {
+      id: row.person_id,
+      name: row.person_name,
+      mobile_number: row.mobile_number,
+      age_years: row.age_years,
+      is_student: row.is_student,
+    },
     camp: row.camp_id ? {
-      id: row.camp_id,
+      id: row.joined_camp_id ?? row.camp_id,
       camp_name: row.camp_name,
       camp_date: row.camp_date,
     } : null,
     worker: row.worker_id ? {
-      id: row.worker_id,
+      id: row.joined_worker_id ?? row.worker_id,
       full_name: row.worker_full_name,
     } : null,
     village: row.village,
@@ -322,6 +502,7 @@ function formatScreeningResponse(row) {
     ecg: row.ecg,
     echo_heart: row.echo_heart,
     advice: row.advice,
+    recommended_investigations: row.recommended_investigations ?? null,
     photo_url: row.photo_url,
     screening_date: row.screening_date,
     notes: row.notes,
@@ -333,8 +514,10 @@ function formatScreeningResponse(row) {
 
 export default {
   createScreening,
+  findPersonByMobile,
   getScreeningById,
   getAllScreenings,
+  getScreeningsByPersonId,
   getScreeningsByUserId,
   getScreeningsByCampId,
   getScreeningsByWorkerId,

@@ -1,6 +1,11 @@
-// Main server entry point
+// mainServer2.js
+// Local Windows development/testing entry point — HTTP only, no SSL.
+// Mirrors mainServer.js behavior minus the HTTPS listener and SSL cert loading.
+// Do not deploy this file to production.
+
 import express from 'express';
 import cors from 'cors';
+import http from 'http';
 import { config } from './src/config/index.js';
 import { errorHandler, notFoundHandler } from './src/middleware/errorHandler.js';
 import healthRoutes from './src/routes/health.js';
@@ -39,8 +44,11 @@ app.use(notFoundHandler);
 // Error handler
 app.use(errorHandler);
 
-// Start server
-const PORT = config.server.port;
+// Port (HTTP only — local development)
+const PORT = config.server.port; // HTTP (currently 5000)
+
+// Track server for graceful shutdown
+let httpServer = null;
 
 function startServer() {
   try {
@@ -50,7 +58,7 @@ function startServer() {
     if (!config.db.user) missing.push('DB_USER');
     if (!config.db.password) missing.push('DB_PASSWORD');
     if (!config.db.name) missing.push('DB_NAME');
-    
+
     if (missing.length > 0) {
       console.warn(`⚠️  Missing required environment variables: ${missing.join(', ')}`);
       console.warn('   Database connection will fail. Please fill in .env file.');
@@ -58,11 +66,15 @@ function startServer() {
       console.log('Configuration validated');
     }
 
-    app.listen(PORT, () => {
-      console.log(`🚀 Server running on port ${PORT}`);
-      console.log(`📡 Environment: ${config.server.nodeEnv}`);
-      console.log(`🔗 Health check: http://localhost:${PORT}/api/health`);
+    // ----- HTTP server (port 5000) -----
+    httpServer = http.createServer(app);
+    httpServer.listen(PORT, () => {
+      console.log(`🚀 HTTP  server running on http://localhost:${PORT}`);
+      console.log(`🔗 Health check (HTTP):  http://localhost:${PORT}/api/health`);
+      console.log('🪟  Local Windows development mode (HTTP only, no SSL)');
     });
+
+    console.log(`📡 Environment: ${config.server.nodeEnv}`);
   } catch (err) {
     console.error('Failed to start server:', err);
     process.exit(1);
@@ -70,19 +82,28 @@ function startServer() {
 }
 
 // Graceful shutdown
-process.on('SIGTERM', async () => {
-  console.log('SIGTERM received, shutting down gracefully...');
-  const { closePool } = await import('./src/db/pool.js');
-  await closePool();
-  process.exit(0);
-});
+async function shutdown(signal) {
+  console.log(`${signal} received, shutting down gracefully...`);
 
-process.on('SIGINT', async () => {
-  console.log('SIGINT received, shutting down gracefully...');
-  const { closePool } = await import('./src/db/pool.js');
-  await closePool();
+  // Close HTTP server
+  if (httpServer) {
+    await new Promise((resolve) => httpServer.close(resolve));
+    console.log('HTTP server closed');
+  }
+
+  // Close DB pool
+  try {
+    const { closePool } = await import('./src/db/pool.js');
+    await closePool();
+  } catch (err) {
+    console.error('Error closing DB pool:', err.message);
+  }
+
   process.exit(0);
-});
+}
+
+process.on('SIGTERM', () => shutdown('SIGTERM'));
+process.on('SIGINT', () => shutdown('SIGINT'));
 
 startServer();
 

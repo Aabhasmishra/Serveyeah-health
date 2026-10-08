@@ -469,6 +469,10 @@ export const surveysApi = {
 // Utility Functions
 // ============================================
 
+export function getApiBaseUrl(): string {
+  return API_BASE_URL;
+}
+
 export function getDevUserId(): string {
   return DEV_USER_ID;
 }
@@ -499,11 +503,15 @@ export function getApiErrorMessage(response: ApiResponse<unknown>): string {
  *
  * Every date the app shows is DD-MM-YYYY (e.g. 10-12-2026), so this delegates
  * to the one central formatter rather than building a locale string. The
- * `options` parameter is accepted for backwards compatibility but intentionally
- * ignored: allowing a caller to opt out of DD-MM-YYYY is how screens drift
- * apart. Use formatTimestampWithTimeDdMmYyyy when the time is also wanted.
+ * `options` parameter is retained for backwards compatibility with existing
+ * callers, but is intentionally ignored: allowing a caller to opt out of
+ * DD-MM-YYYY is how screens drift apart. Use formatTimestampWithTimeDdMmYyyy
+ * when the time is also wanted.
  */
-export function formatBackendDate(dateString: string | null | undefined): string {
+export function formatBackendDate(
+  dateString: string | null | undefined,
+  _options?: Intl.DateTimeFormatOptions
+): string {
   return formatDateDdMmYyyy(dateString);
 }
 
